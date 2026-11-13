@@ -15,6 +15,11 @@ public class LedgerApplication {
 		return "Hello World!";
 	}
 
+	@RequestMapping("/health")
+	String get_heatlh(){
+		return "Healthy!";
+	}
+
 	public static void main(String[] args) {
 		SpringApplication.run(LedgerApplication.class, args);
 	}
