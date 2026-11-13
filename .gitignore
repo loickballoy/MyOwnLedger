@@ -34,5 +34,4 @@ build/
 
 ## My own ##
 .env
-.mvn/
 mvnw.*
