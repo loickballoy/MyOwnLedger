@@ -1,0 +1,645 @@
+openapi: 3.0.3
+info:
+  title: Ledger API
+  version: 1.0.0
+  description: |
+    Contract of the LEDGER project. Every status code, field name and error code
+    written here is tested by the moulinette. Amounts are always JSON strings.
+servers:
+  - url: http://localhost:8080
+
+tags:
+  - name: health
+  - name: accounts
+  - name: transactions
+  - name: rules
+  - name: imports
+  - name: reconciliation
+  - name: reports
+
+paths:
+  /health:
+    get:
+      tags: [health]
+      summary: Liveness check
+      responses:
+        "200":
+          description: The service is up
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status: { type: string, enum: [UP] }
+
+  /accounts:
+    get:
+      tags: [accounts]
+      summary: List all accounts, ordered by id
+      responses:
+        "200":
+          description: All accounts
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Account" }
+    post:
+      tags: [accounts]
+      summary: Create an account
+      description: |
+        allowNegative is optional. It defaults to false for ASSET accounts and to
+        true for every other type.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateAccountRequest" }
+            example: { name: UBS Checking, type: ASSET, currency: CHF, allowNegative: false }
+      responses:
+        "201":
+          description: Account created
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Account" }
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "409":
+          description: ACCOUNT_NAME_TAKEN
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /accounts/{accountId}:
+    get:
+      tags: [accounts]
+      summary: Get one account
+      parameters: [{ $ref: "#/components/parameters/AccountId" }]
+      responses:
+        "200":
+          description: The account
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Account" }
+        "404": { $ref: "#/components/responses/AccountNotFound" }
+
+  /accounts/{accountId}/balance:
+    get:
+      tags: [accounts]
+      summary: Balance of an account at the end of a day
+      description: |
+        Sum of the postings of the account whose transaction date is on or before
+        asOf (inclusive). asOf defaults to the current date.
+      parameters:
+        - { $ref: "#/components/parameters/AccountId" }
+        - name: asOf
+          in: query
+          required: false
+          schema: { $ref: "#/components/schemas/Date" }
+      responses:
+        "200":
+          description: The balance
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Balance" }
+              example: { accountId: 1, currency: CHF, asOf: "2026-10-31", balance: "5307.10" }
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "404": { $ref: "#/components/responses/AccountNotFound" }
+
+  /accounts/{accountId}/postings:
+    get:
+      tags: [accounts]
+      summary: Account statement between two dates (inclusive)
+      description: |
+        Postings ordered by transaction date, then transaction id.
+        openingBalance is the balance at the end of the day before `from`.
+        runningBalance is the balance right after each posting. It must be
+        computed in SQL with a window function.
+      parameters:
+        - { $ref: "#/components/parameters/AccountId" }
+        - { name: from, in: query, required: true, schema: { $ref: "#/components/schemas/Date" } }
+        - { name: to, in: query, required: true, schema: { $ref: "#/components/schemas/Date" } }
+      responses:
+        "200":
+          description: The statement
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AccountStatement" }
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "404": { $ref: "#/components/responses/AccountNotFound" }
+
+  /transactions:
+    post:
+      tags: [transactions]
+      summary: Post a balanced transaction
+      description: |
+        Rules, checked in this order of severity:
+          * malformed body, fewer than two postings, zero amount, more than two
+            decimals, same account twice -> 400 VALIDATION_ERROR
+          * a posting references an unknown account -> 422 UNKNOWN_ACCOUNT
+          * accounts in different currencies -> 422 CURRENCY_MISMATCH
+          * postings do not sum to zero -> 422 UNBALANCED
+          * an account with allowNegative=false would end with a negative total
+            balance (all postings, whatever their date) -> 422 INSUFFICIENT_FUNDS
+        A rejected request writes nothing.
+      parameters: [{ $ref: "#/components/parameters/IdempotencyKey" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateTransactionRequest" }
+            example:
+              date: "2026-10-01"
+              description: Rent October
+              postings:
+                - { accountId: 1, amount: "-1500.00" }
+                - { accountId: 4, amount: "1500.00" }
+      responses:
+        "201":
+          description: |
+            Transaction committed. Replaying the same Idempotency-Key with the same
+            body returns this exact response again and writes nothing.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Transaction" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "409": { $ref: "#/components/responses/IdempotencyInProgress" }
+        "422":
+          description: UNKNOWN_ACCOUNT, CURRENCY_MISMATCH, UNBALANCED, INSUFFICIENT_FUNDS or IDEMPOTENCY_KEY_REUSED
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /transactions/{transactionId}:
+    get:
+      tags: [transactions]
+      summary: Get one transaction
+      parameters: [{ $ref: "#/components/parameters/TransactionId" }]
+      responses:
+        "200":
+          description: The transaction, same body as its creation response
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Transaction" }
+        "404": { $ref: "#/components/responses/TransactionNotFound" }
+
+  /transactions/{transactionId}/reversal:
+    post:
+      tags: [transactions]
+      summary: Reverse a transaction
+      description: |
+        Creates a new transaction with every amount negated, description
+        "Reversal of #<id>" and reversalOf set. A transaction can be reversed once.
+        The reversal is subject to INSUFFICIENT_FUNDS like any transaction.
+        Idempotency keys are scoped per endpoint: the same key may be used on
+        POST /transactions and on a reversal without conflict.
+      parameters:
+        - { $ref: "#/components/parameters/TransactionId" }
+        - { $ref: "#/components/parameters/IdempotencyKey" }
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                date: { $ref: "#/components/schemas/Date" }
+            example: { date: "2026-10-02" }
+      responses:
+        "201":
+          description: The reversing transaction
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Transaction" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/TransactionNotFound" }
+        "409":
+          description: ALREADY_REVERSED or IDEMPOTENCY_IN_PROGRESS
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "422":
+          description: INSUFFICIENT_FUNDS or IDEMPOTENCY_KEY_REUSED
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /rules:
+    get:
+      tags: [rules]
+      summary: List categorization rules, ordered by priority then id
+      responses:
+        "200":
+          description: All rules
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Rule" }
+    post:
+      tags: [rules]
+      summary: Create a categorization rule
+      description: |
+        pattern is a Java regular expression matched case-insensitively anywhere in
+        the entry description. The target account must be of type INCOME or EXPENSE.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateRuleRequest" }
+            example: { pattern: "MIGROS|COOP", accountId: 5, priority: 20 }
+      responses:
+        "201":
+          description: Rule created
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Rule" }
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "422":
+          description: UNKNOWN_ACCOUNT or INVALID_RULE_TARGET
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /accounts/{accountId}/imports/camt053:
+    post:
+      tags: [imports]
+      summary: Import an ISO 20022 camt.053 bank statement
+      description: |
+        The whole file is imported in one database transaction. Only BOOK entries
+        are imported; other statuses are counted in `ignored`. Entries already
+        imported for this account (same AcctSvcrRef) are counted in `duplicates`.
+        Imported transactions are not subject to INSUFFICIENT_FUNDS.
+      parameters: [{ $ref: "#/components/parameters/AccountId" }]
+      requestBody:
+        required: true
+        content:
+          application/xml:
+            schema: { type: string }
+      responses:
+        "201":
+          description: Import summary
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ImportResult" }
+              example: { statementId: STMT-2026-10, entries: 5, imported: 5, duplicates: 0, ignored: 0, uncategorized: 1 }
+        "404": { $ref: "#/components/responses/AccountNotFound" }
+        "422":
+          description: INVALID_STATEMENT, CURRENCY_MISMATCH or STATEMENT_CONFLICT
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /accounts/{accountId}/imports/csv:
+    post:
+      tags: [imports]
+      summary: Fallback import, semicolon-separated CSV
+      description: |
+        Header line `date;description;amount;reference`. amount is signed from the
+        bank account's point of view (negative = money out). reference plays the
+        role of AcctSvcrRef. statementId is null in the result.
+      parameters: [{ $ref: "#/components/parameters/AccountId" }]
+      requestBody:
+        required: true
+        content:
+          text/csv:
+            schema: { type: string }
+      responses:
+        "201":
+          description: Import summary
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ImportResult" }
+        "404": { $ref: "#/components/responses/AccountNotFound" }
+        "422":
+          description: INVALID_STATEMENT
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /accounts/{accountId}/statements/{statementId}/reconciliation:
+    get:
+      tags: [reconciliation]
+      summary: Compare a statement's booked balances with the ledger
+      description: |
+        The opening balance dated D is compared with the ledger balance at the end
+        of day D-1, the closing balance dated D with the ledger balance at the end
+        of day D. difference = ledger - statement. status is MATCHED when both
+        differences are 0.00, MISMATCH otherwise.
+      parameters:
+        - { $ref: "#/components/parameters/AccountId" }
+        - name: statementId
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Reconciliation result
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Reconciliation" }
+        "404":
+          description: ACCOUNT_NOT_FOUND or STATEMENT_NOT_FOUND
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /reports/monthly:
+    get:
+      tags: [reports]
+      summary: Income and expenses of one month, in one currency
+      description: |
+        Amounts are shown positive in their natural direction. Lines are sorted by
+        amount descending, then account name ascending. Accounts without postings
+        in the month are omitted. net = totalIncome - totalExpenses.
+        The aggregation is done in a single SQL query.
+      parameters:
+        - { name: month, in: query, required: true, schema: { $ref: "#/components/schemas/Month" } }
+        - { name: currency, in: query, required: true, schema: { $ref: "#/components/schemas/Currency" } }
+      responses:
+        "200":
+          description: The report
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/MonthlyReport" }
+        "400": { $ref: "#/components/responses/ValidationError" }
+
+  /reports/net-worth:
+    get:
+      tags: [reports]
+      summary: Net worth at the end of each month of a range (inclusive)
+      description: |
+        Net worth = sum of ASSET and LIABILITY balances in the currency. Every month
+        of the range appears, including months without postings. One SQL query,
+        using a window function.
+      parameters:
+        - { name: from, in: query, required: true, schema: { $ref: "#/components/schemas/Month" } }
+        - { name: to, in: query, required: true, schema: { $ref: "#/components/schemas/Month" } }
+        - { name: currency, in: query, required: true, schema: { $ref: "#/components/schemas/Currency" } }
+      responses:
+        "200":
+          description: The series
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/NetWorth" }
+        "400": { $ref: "#/components/responses/ValidationError" }
+
+components:
+  parameters:
+    AccountId:
+      name: accountId
+      in: path
+      required: true
+      schema: { type: integer, format: int64 }
+    TransactionId:
+      name: transactionId
+      in: path
+      required: true
+      schema: { type: integer, format: int64 }
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: |
+        1 to 64 visible ASCII characters. Missing or too long -> 400
+        IDEMPOTENCY_KEY_MISSING. Same key and same body -> the original response is
+        returned. Same key and different body -> 422 IDEMPOTENCY_KEY_REUSED.
+      schema: { type: string, minLength: 1, maxLength: 64 }
+
+  responses:
+    ValidationError:
+      description: VALIDATION_ERROR
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    BadRequest:
+      description: VALIDATION_ERROR or IDEMPOTENCY_KEY_MISSING
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    AccountNotFound:
+      description: ACCOUNT_NOT_FOUND
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    TransactionNotFound:
+      description: TRANSACTION_NOT_FOUND
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    IdempotencyInProgress:
+      description: |
+        IDEMPOTENCY_IN_PROGRESS, only if you chose to reject a duplicate while the
+        first request with the same key is still running.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+
+  schemas:
+    Amount:
+      description: Signed decimal, at most two decimals, at most 12 integer digits.
+      type: string
+      pattern: '^-?(0|[1-9][0-9]{0,11})(\.[0-9]{1,2})?$'
+      example: "-1500.00"
+    MoneyOut:
+      description: Amount as returned by the API, always exactly two decimals.
+      type: string
+      pattern: '^-?(0|[1-9][0-9]*)\.[0-9]{2}$'
+      example: "5307.10"
+    Date:
+      type: string
+      format: date
+      example: "2026-10-01"
+    Month:
+      type: string
+      pattern: '^[0-9]{4}-(0[1-9]|1[0-2])$'
+      example: "2026-10"
+    Currency:
+      type: string
+      pattern: '^[A-Z]{3}$'
+      example: CHF
+    AccountType:
+      type: string
+      enum: [ASSET, LIABILITY, EQUITY, INCOME, EXPENSE]
+
+    CreateAccountRequest:
+      type: object
+      required: [name, type, currency]
+      properties:
+        name: { type: string, minLength: 1, maxLength: 100 }
+        type: { $ref: "#/components/schemas/AccountType" }
+        currency: { $ref: "#/components/schemas/Currency" }
+        allowNegative: { type: boolean }
+    Account:
+      type: object
+      required: [id, name, type, currency, allowNegative]
+      properties:
+        id: { type: integer, format: int64 }
+        name: { type: string }
+        type: { $ref: "#/components/schemas/AccountType" }
+        currency: { $ref: "#/components/schemas/Currency" }
+        allowNegative: { type: boolean }
+    Balance:
+      type: object
+      required: [accountId, currency, asOf, balance]
+      properties:
+        accountId: { type: integer, format: int64 }
+        currency: { $ref: "#/components/schemas/Currency" }
+        asOf: { $ref: "#/components/schemas/Date" }
+        balance: { $ref: "#/components/schemas/MoneyOut" }
+
+    PostingRequest:
+      type: object
+      required: [accountId, amount]
+      properties:
+        accountId: { type: integer, format: int64 }
+        amount: { $ref: "#/components/schemas/Amount" }
+    Posting:
+      type: object
+      required: [accountId, amount]
+      properties:
+        accountId: { type: integer, format: int64 }
+        amount: { $ref: "#/components/schemas/MoneyOut" }
+    CreateTransactionRequest:
+      type: object
+      required: [date, description, postings]
+      properties:
+        date: { $ref: "#/components/schemas/Date" }
+        description: { type: string, minLength: 1, maxLength: 255 }
+        postings:
+          type: array
+          minItems: 2
+          items: { $ref: "#/components/schemas/PostingRequest" }
+    Transaction:
+      type: object
+      required: [id, date, description, reversalOf, postings]
+      description: Postings are returned in the order they were sent.
+      properties:
+        id: { type: integer, format: int64 }
+        date: { $ref: "#/components/schemas/Date" }
+        description: { type: string }
+        reversalOf: { type: integer, format: int64, nullable: true }
+        postings:
+          type: array
+          items: { $ref: "#/components/schemas/Posting" }
+
+    StatementPosting:
+      type: object
+      required: [transactionId, date, description, amount, runningBalance]
+      properties:
+        transactionId: { type: integer, format: int64 }
+        date: { $ref: "#/components/schemas/Date" }
+        description: { type: string }
+        amount: { $ref: "#/components/schemas/MoneyOut" }
+        runningBalance: { $ref: "#/components/schemas/MoneyOut" }
+    AccountStatement:
+      type: object
+      required: [accountId, openingBalance, postings]
+      properties:
+        accountId: { type: integer, format: int64 }
+        openingBalance: { $ref: "#/components/schemas/MoneyOut" }
+        postings:
+          type: array
+          items: { $ref: "#/components/schemas/StatementPosting" }
+
+    CreateRuleRequest:
+      type: object
+      required: [pattern, accountId, priority]
+      properties:
+        pattern: { type: string, minLength: 1, maxLength: 255 }
+        accountId: { type: integer, format: int64 }
+        priority: { type: integer, minimum: 0 }
+    Rule:
+      type: object
+      required: [id, pattern, accountId, priority]
+      properties:
+        id: { type: integer, format: int64 }
+        pattern: { type: string }
+        accountId: { type: integer, format: int64 }
+        priority: { type: integer }
+
+    ImportResult:
+      type: object
+      required: [statementId, entries, imported, duplicates, ignored, uncategorized]
+      properties:
+        statementId: { type: string, nullable: true }
+        entries: { type: integer, description: Number of Ntry elements (or CSV lines) in the file }
+        imported: { type: integer }
+        duplicates: { type: integer }
+        ignored: { type: integer, description: Entries whose status is not BOOK }
+        uncategorized: { type: integer, description: Imported entries that matched no rule }
+
+    ReconciliationSide:
+      type: object
+      required: [date, statement, ledger, difference]
+      properties:
+        date: { $ref: "#/components/schemas/Date" }
+        statement: { $ref: "#/components/schemas/MoneyOut" }
+        ledger: { $ref: "#/components/schemas/MoneyOut" }
+        difference: { $ref: "#/components/schemas/MoneyOut" }
+    Reconciliation:
+      type: object
+      required: [statementId, opening, closing, status]
+      properties:
+        statementId: { type: string }
+        opening: { $ref: "#/components/schemas/ReconciliationSide" }
+        closing: { $ref: "#/components/schemas/ReconciliationSide" }
+        status: { type: string, enum: [MATCHED, MISMATCH] }
+
+    ReportLine:
+      type: object
+      required: [account, amount]
+      properties:
+        account: { type: string }
+        amount: { $ref: "#/components/schemas/MoneyOut" }
+    MonthlyReport:
+      type: object
+      required: [month, currency, income, expenses, totalIncome, totalExpenses, net]
+      properties:
+        month: { $ref: "#/components/schemas/Month" }
+        currency: { $ref: "#/components/schemas/Currency" }
+        income: { type: array, items: { $ref: "#/components/schemas/ReportLine" } }
+        expenses: { type: array, items: { $ref: "#/components/schemas/ReportLine" } }
+        totalIncome: { $ref: "#/components/schemas/MoneyOut" }
+        totalExpenses: { $ref: "#/components/schemas/MoneyOut" }
+        net: { $ref: "#/components/schemas/MoneyOut" }
+    NetWorth:
+      type: object
+      required: [currency, months]
+      properties:
+        currency: { $ref: "#/components/schemas/Currency" }
+        months:
+          type: array
+          items:
+            type: object
+            required: [month, netWorth]
+            properties:
+              month: { $ref: "#/components/schemas/Month" }
+              netWorth: { $ref: "#/components/schemas/MoneyOut" }
+
+    Error:
+      type: object
+      required: [error, message]
+      properties:
+        error:
+          type: string
+          enum:
+            - VALIDATION_ERROR
+            - IDEMPOTENCY_KEY_MISSING
+            - ACCOUNT_NOT_FOUND
+            - TRANSACTION_NOT_FOUND
+            - STATEMENT_NOT_FOUND
+            - ACCOUNT_NAME_TAKEN
+            - ALREADY_REVERSED
+            - IDEMPOTENCY_IN_PROGRESS
+            - UNKNOWN_ACCOUNT
+            - CURRENCY_MISMATCH
+            - UNBALANCED
+            - INSUFFICIENT_FUNDS
+            - IDEMPOTENCY_KEY_REUSED
+            - INVALID_RULE_TARGET
+            - INVALID_STATEMENT
+            - STATEMENT_CONFLICT
+        message:
+          type: string
+          description: Free text. Never tested.

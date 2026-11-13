@@ -5,9 +5,9 @@ services:
     image: postgres:16
     container_name: postgres
     environment:
+      POSTGRES_DB: ledger
       POSTGRES_USER: ledger
       POSTGRES_PASSWORD: ledger
-      POSTGRES_DB: ledger
     volumes:
       - postgres_data:/var/lib/postgresql@16/data
     ports:

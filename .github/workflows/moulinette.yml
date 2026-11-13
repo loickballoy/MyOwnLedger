@@ -1,0 +1,44 @@
+name: moulinette
+run-name: ${{ github.actor }} is running against the code on tag: ${{ github.ref_name}}
+
+on: 
+  push:
+    tags:
+     - submit-l[0-5]-*
+     - submit-mutant-*
+
+env:
+  LEDGER_DB_URL: jdbc:postgresql://localhost:5432/ledger
+  LEDGER_DB_USERNAME: ledger
+  LEDGER_DB_PASSWORD: ledger
+  LEDGER_PORT: 8080
+  LEDGER_BASE_URL: http://localhost:8080
+
+jobs:
+  moulinette-pipeline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - run: docker compose up -d --wait
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: 21
+          cache: maven
+      - run: ./mvnw -q package -DskipTests
+      - run: java -jar target/ledger-1.0.0.jar > logs.txt 2>&1 &
+      
+      - id: getHealth
+        run: curl $LEDGER_BASE_URL/health --retry 30 --retry-delay 2 --retry-connrefused --retry-max-time 60
+
+      - if: steps.getHealth.outcome == 'success'
+        run: ./mvnw -f acceptance/pom.xml verify
+     
+      - if: always()
+        run: cat logs.txt 
+      - if: always()
+        run: docker compose logs db
