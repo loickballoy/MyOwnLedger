@@ -1,5 +1,5 @@
 name: moulinette
-run-name: ${{ github.actor }} is running against the code on tag: ${{ github.ref_name}}
+run-name: ${{ github.actor }} is running against the code
 
 on: 
   push:
