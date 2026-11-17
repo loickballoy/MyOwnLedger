@@ -1,0 +1,26 @@
+name: ci
+run-name: ${{ github.actor }} verifying
+
+on: push
+
+env:
+  LEDGER_DB_URL: jdbc:postgresql://localhost:5433/ledger2
+  LEDGER_DB_USERNAME: ledger
+  LEDGER_DB_PASSWORD: ledger
+  LEDGER_PORT: 8080
+  LEDGER_BASE_URL: http://localhost:8080
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - run: docker compose up -d --wait
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: 21
+          cache: maven
+      - run: ./mvnw verify

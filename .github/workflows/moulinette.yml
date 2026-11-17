@@ -8,7 +8,7 @@ on:
      - submit-mutant-*
 
 env:
-  LEDGER_DB_URL: jdbc:postgresql://localhost:5433/ledger2
+  LEDGER_DB_URL: jdbc:postgresql://localhost:5432/ledger
   LEDGER_DB_USERNAME: ledger
   LEDGER_DB_PASSWORD: ledger
   LEDGER_PORT: 8080
@@ -29,14 +29,21 @@ jobs:
           distribution: temurin
           java-version: 21
           cache: maven
-      - run: ./mvnw -q package -DskipTests
+      - id: build
+        run: ./mvnw -q package -DskipTests
       - run: java -jar target/ledger-1.0.0.jar > logs.txt 2>&1 &
       
       - id: getHealth
         run: curl $LEDGER_BASE_URL/health --retry 30 --retry-delay 2 --retry-connrefused --retry-max-time 60
 
       - if: steps.getHealth.outcome == 'success'
-        run: ./mvnw -f acceptance/pom.xml verify
+        run: ./mvnw -f acceptance/pom.xml test -Dmaven.test.failure.ignore=true
+
+      - if: always()
+        env:
+          BUILD_OUTCOME: ${{ steps.build.outcome }}
+          START_OUTCOME: ${{ steps.getHealth.outcome }}
+        run: python3 acceptance/report/trace.py --markdown >> "$GITHUB_STEP_SUMMARY"
      
       - if: always()
         run: cat logs.txt 
